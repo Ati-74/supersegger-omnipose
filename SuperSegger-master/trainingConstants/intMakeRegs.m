@@ -37,7 +37,117 @@ end
 %ss = size( data.mask_cell ); %comment out
 NUM_INFO = CONST.regionScoreFun.NUM_INFO;
 %%
+
+% Construct the Raw Image Path
+[maskDir, maskName, ~] = fileparts(maskpath); % Extract directory and name of mask
+
+% List all the PNG files in the directory
+all_files = dir(fullfile(maskDir, '*.png'));
+all_filenames = {all_files.name};
+
+% Find the index of the specified image in the list
+file_index = find(strcmp(all_filenames, strcat(maskName, '.png')));
+
+[parentDir, ~, ~] = fileparts(maskDir);  % Get the parent directory
+[parentDir, ~, ~] = fileparts(parentDir);  % Get the parent directory
+rawImageDir = fullfile(parentDir, 'raw_im'); % Get directory of raw images
+
+% crop box
+load(strcat(rawImageDir, '/cropbox.mat'),'crop_box_array');
+
 labeledmask = double(imread(maskpath)); %load cellpose mask
+
+stats = regionprops(labeledmask, 'PixelList'); % Get pixel coordinates of each region
+
+for k = 1:length(stats)
+    x = stats(k).PixelList(:,1);
+    y = stats(k).PixelList(:,2);
+    
+    if any(x <= round(crop_box_array{1, 1}(file_index , 2))) || ...
+            any(x >= round(crop_box_array{1, 1}(file_index , 4)) - 1) || ...
+            any(y <= round(crop_box_array{1, 1}(file_index , 1))) || ...
+            any(y >= round(crop_box_array{1, 1}(file_index , 3)) - 1)
+   
+        % Populate the mask with the region
+        diff_x_values = diff(x);
+        if any(diff_x_values > 2)
+            if any(x(find(diff_x_values > 2) + 1:length(x)) <= round(crop_box_array{1, 1}(file_index , 2)) + 1) || ...
+                    any(x(find(diff_x_values > 2) + 1:length(x)) >= round(crop_box_array{1, 1}(file_index , 4)) - 1) || ...
+                    any(y(find(diff_x_values > 2) + 1:length(x)) <= round(crop_box_array{1, 1}(file_index , 1)) + 1) || ...
+                    any(y(find(diff_x_values > 2) + 1:length(x)) >= round(crop_box_array{1, 1}(file_index , 3)) - 1)
+                
+                for j = find(diff_x_values > 2) + 1: length(x)
+                    labeledmask(y(j), x(j)) = 0;
+                end  
+            end
+            
+            if any(x(1:find(diff_x_values > 2)) <= round(crop_box_array{1, 1}(file_index , 2)) + 1) || ...
+                    any(x(1:find(diff_x_values > 2)) >= round(crop_box_array{1, 1}(file_index , 4)) - 1) || ...
+                    any(y(1:find(diff_x_values > 2)) <= round(crop_box_array{1, 1}(file_index , 1)) + 1) || ...
+                    any(y(1:find(diff_x_values > 2)) >= round(crop_box_array{1, 1}(file_index , 3)) - 1)
+                
+                for j = 1:find(diff_x_values > 2)
+                    labeledmask(y(j), x(j)) = 0;
+                end  
+            end
+        else
+           for j = 1:length(x)
+                labeledmask(y(j), x(j)) = 0;
+           end 
+        end
+    end
+end
+
+
+reduced_labeledmask = labeledmask(round(crop_box_array{1, 1}(file_index , 1)) : round(crop_box_array{1, 1}(file_index , 3)) - 1,  round(crop_box_array{1, 1}(file_index , 2)): round(crop_box_array{1, 1}(file_index , 4)) - 1);
+
+%% my script to write the segmented objects
+% Generate unique colors for each region
+unique_colors = generate_unique_colors(max(reduced_labeledmask(:)));
+
+% Create an RGB image based on the unique colors
+[rows, cols] = size(reduced_labeledmask);
+colored_mask = zeros(rows, cols, 3); % Initialize an RGB image
+
+for k = 1:max(reduced_labeledmask(:))
+    mask = reduced_labeledmask == k;
+    for channel = 1:3
+        colored_mask(:, :, channel) = colored_mask(:, :, channel) + mask * unique_colors(k, channel);
+    end
+end
+colored_mask = uint8(colored_mask); % Convert to ui
+
+
+% Determine directory and filename for saving
+[out_dir, filename, ~] = fileparts(maskpath);
+[parent_dir, ~, ~] = fileparts(out_dir);
+
+save_dir = fullfile(parent_dir, 'rgbObjects');
+save_dir_BW = fullfile(parent_dir, 'BWObjects');
+
+
+% Create directory save_dir if it doesn't exist
+if ~exist(save_dir, 'dir')
+    mkdir(save_dir);
+end
+
+
+if ~exist(save_dir_BW, 'dir')
+    mkdir(save_dir_BW);
+end
+
+
+% Save the result in .mat format
+save_path = fullfile(save_dir, [filename '.mat']);
+save(save_path, 'colored_mask');
+
+%% Create Binary BW Image
+bw_image = reduced_labeledmask > 0; % Any non-zero value in the mask is considered as object
+
+% Save the binary image as .tif
+bw_save_path = fullfile(save_dir_BW, [filename '.tif']);
+imwrite(bw_image, bw_save_path);
+
 ss = size(labeledmask);
 data.regs.regs_label = labeledmask; %create regs_label with cellpose mask 
 
@@ -77,5 +187,38 @@ if ~exist( 'mask_bad_regs', 'var' ) || isempty( mask_bad_regs )
     end
 end
 
+
+
+% Function to generate unique colors
+function colors = generate_unique_colors(num_colors, max_rgb)
+    if nargin < 2
+        max_rgb = 240;
+    end
+
+    skip = ceil(max_rgb / nthroot(num_colors, 3));
+
+    colors = zeros(num_colors, 3); % Initialize an Nx3 matrix for RGB values
+    color_count = 1;
+
+    while color_count <= num_colors
+        for r = 0:skip:max_rgb
+            for g = 0:skip:max_rgb
+                for b = 0:skip:max_rgb
+                    if color_count <= num_colors
+                        colors(color_count, :) = [r+1, g+1, b+1];
+                        color_count = color_count + 1;
+                    else
+                        return;
+                    end
+                end
+            end
+        end
+
+        skip = skip - 1;
+        if skip <= 0
+            error('Unable to generate the required number of colors with the given constraints.');
+        end
+    end
+end
 
 end
